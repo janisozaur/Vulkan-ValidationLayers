@@ -1,7 +1,7 @@
-/* Copyright (c) 2015-2016 The Khronos Group Inc.
- * Copyright (c) 2015-2016 Valve Corporation
- * Copyright (c) 2015-2016 LunarG, Inc.
- * Copyright (C) 2015-2016 Google Inc.
+/* Copyright (c) 2015-2018 The Khronos Group Inc.
+ * Copyright (c) 2015-2018 Valve Corporation
+ * Copyright (c) 2015-2018 LunarG, Inc.
+ * Copyright (C) 2015-2018 Google Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@
  * Author: Tobin Ehlis <tobine@google.com>
  * Author: Chris Forbes <chrisf@ijw.co.nz>
  * Author: Mark Lobodzinski <mark@lunarg.com>
+ * Author: Dave Houlton <daveh@lunarg.com>
  */
 #ifndef CORE_VALIDATION_TYPES_H_
 #define CORE_VALIDATION_TYPES_H_
@@ -32,13 +33,14 @@
 #include "vk_extension_helper.h"
 #include <atomic>
 #include <functional>
+#include <list>
 #include <map>
+#include <memory>
+#include <set>
 #include <string.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include <memory>
-#include <list>
 
 // Fwd declarations -- including descriptor_set.h creates an ugly include loop
 namespace cvdescriptorset {
@@ -287,6 +289,7 @@ class IMAGE_STATE : public BINDABLE {
     bool get_sparse_reqs_called;  // Track if GetImageSparseMemoryRequirements() has been called for this image
     bool sparse_metadata_required;  // Track if sparse metadata aspect is required for this image
     bool sparse_metadata_bound;     // Track if sparse metadata aspect is bound to this image
+    bool imported_ahb;              // True if image was imported from an Android Hardware Buffer
     std::vector<VkSparseImageMemoryRequirements> sparse_requirements;
     IMAGE_STATE(VkImage img, const VkImageCreateInfo *pCreateInfo)
         : image(img),
@@ -298,6 +301,7 @@ class IMAGE_STATE : public BINDABLE {
           get_sparse_reqs_called(false),
           sparse_metadata_required(false),
           sparse_metadata_bound(false),
+          imported_ahb(false),
           sparse_requirements{} {
         if ((createInfo.sharingMode == VK_SHARING_MODE_CONCURRENT) && (createInfo.queueFamilyIndexCount > 0)) {
             uint32_t *pQueueFamilyIndices = new uint32_t[createInfo.queueFamilyIndexCount];
@@ -355,6 +359,8 @@ struct DEVICE_MEM_INFO : public BASE_NODE {
     bool is_dedicated;
     VkBuffer dedicated_buffer;
     VkImage dedicated_image;
+    bool is_export;
+    VkExternalMemoryHandleTypeFlags export_handle_type_flags;
     std::unordered_set<VK_OBJECT> obj_bindings;               // objects bound to this memory
     std::unordered_map<uint64_t, MEMORY_RANGE> bound_ranges;  // Map of object to its binding range
     // Convenience vectors image/buff handles to speed up iterating over images or buffers independently
@@ -375,6 +381,8 @@ struct DEVICE_MEM_INFO : public BASE_NODE {
           is_dedicated(false),
           dedicated_buffer(VK_NULL_HANDLE),
           dedicated_image(VK_NULL_HANDLE),
+          is_export(false),
+          export_handle_type_flags(0),
           mem_range{},
           shadow_copy_base(0),
           shadow_copy(0),
@@ -1102,6 +1110,135 @@ struct DeviceFeatures {
     VkPhysicalDeviceInlineUniformBlockFeaturesEXT inline_uniform_block;
 };
 
+#ifdef VK_USE_PLATFORM_ANDROID_KHR
+
+// Enumerations of format and usage flags for Android opaque external memory blobs
+typedef enum AHardwareBufferFormat {
+    AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM = 1,
+    AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM = 2,
+    AHARDWAREBUFFER_FORMAT_R8G8B8_UNORM = 3,
+    AHARDWAREBUFFER_FORMAT_R5G6B5_UNORM = 4,
+    AHARDWAREBUFFER_FORMAT_R16G16B16A16_FLOAT = 0x16,
+    AHARDWAREBUFFER_FORMAT_R10G10B10A2_UNORM = 0x2b,
+    AHARDWAREBUFFER_FORMAT_D16_UNORM = 0x30,
+    AHARDWAREBUFFER_FORMAT_D24_UNORM = 0x31,
+    AHARDWAREBUFFER_FORMAT_D24_UNORM_S8_UINT = 0x32,
+    AHARDWAREBUFFER_FORMAT_D32_FLOAT = 0x33,
+    AHARDWAREBUFFER_FORMAT_D32_FLOAT_S8_UINT = 0x34,
+    AHARDWAREBUFFER_FORMAT_S8_UINT = 0x35,
+    AHARDWAREBUFFER_FORMAT_BLOB = 0x21
+} AHardwareBufferFormat;
+
+typedef enum AHardwareBufferUsage {
+    AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE = 0x100,
+    AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT = 0x200,
+    AHARDWAREBUFFER_USAGE_GPU_CUBE_MAP = 0x2000000,
+    AHARDWAREBUFFER_USAGE_GPU_MIPMAP_COMPLETE = 0x4000000,
+    AHARDWAREBUFFER_USAGE_PROTECTED_CONTENT = 0x4000,
+    AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER = 0x1000000
+} AHardwareBufferUsage;
+
+typedef struct AHardwareBuffer_Desc {
+    uint32_t format;  //	   One of AHARDWAREBUFFER_FORMAT_*.
+    uint32_t height;  //	   Height in pixels.
+    uint32_t layers;  //	   Number of images in an image array.
+    uint32_t rfu0;    //	   Initialize to zero, reserved for future use.
+    uint64_t rfu1;    //	   Initialize to zero, reserved for future use.
+    uint32_t stride;  //	   Row stride in pixels, ignored for AHardwareBuffer_allocate()
+    uint64_t usage;   //	   Combination of AHARDWAREBUFFER_USAGE_*.
+    uint32_t width;   //	   Width in pixels.
+} AHardwareBuffer_Desc;
+
+static inline void AndroidNdkAHardwareBufferDescribe(const AHardwareBuffer *buffer, AHardwareBuffer_Desc *outDesc) {
+    // TBD - this should wrap or be replaced by a a call to the NDK's AHardwareBuffer_describe() fxn
+    return;
+}
+
+/* NDK definitions
+Native Activity
+#include <hardware_buffer.h>
+#include <native_activity.h>
+#include <native_window.h>
+#include <native_window_jni.h>
+#include <rect.h>
+#include <window.h>
+Summary
+Enumerations
+Anonymous Enum 15{
+  AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM = 1,
+  AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM = 2,
+  AHARDWAREBUFFER_FORMAT_R8G8B8_UNORM = 3,
+  AHARDWAREBUFFER_FORMAT_R5G6B5_UNORM = 4,
+  AHARDWAREBUFFER_FORMAT_R16G16B16A16_FLOAT = 0x16,
+  AHARDWAREBUFFER_FORMAT_R10G10B10A2_UNORM = 0x2b,
+  AHARDWAREBUFFER_FORMAT_BLOB = 0x21,
+  AHARDWAREBUFFER_FORMAT_D16_UNORM = 0x30,
+  AHARDWAREBUFFER_FORMAT_D24_UNORM = 0x31,
+  AHARDWAREBUFFER_FORMAT_D24_UNORM_S8_UINT = 0x32,
+  AHARDWAREBUFFER_FORMAT_D32_FLOAT = 0x33,
+  AHARDWAREBUFFER_FORMAT_D32_FLOAT_S8_UINT = 0x34,
+  AHARDWAREBUFFER_FORMAT_S8_UINT = 0x35
+}	enum
+Buffer pixel formats.
+Anonymous Enum 16{
+  AHARDWAREBUFFER_USAGE_CPU_READ_NEVER = 0UL,
+  AHARDWAREBUFFER_USAGE_CPU_READ_RARELY = 2UL,
+  AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN = 3UL,
+  AHARDWAREBUFFER_USAGE_CPU_READ_MASK = 0xFUL,
+  AHARDWAREBUFFER_USAGE_CPU_WRITE_NEVER = 0UL << 4,
+  AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY = 2UL << 4,
+  AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN = 3UL << 4,
+  AHARDWAREBUFFER_USAGE_CPU_WRITE_MASK = 0xFUL << 4,
+  AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE = 1UL << 8,
+  AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT = 1UL << 9,
+  AHARDWAREBUFFER_USAGE_PROTECTED_CONTENT = 1UL << 14,
+  AHARDWAREBUFFER_USAGE_VIDEO_ENCODE = 1UL << 16,
+  AHARDWAREBUFFER_USAGE_SENSOR_DIRECT_DATA = 1UL << 23,
+  AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER = 1UL << 24,
+  AHARDWAREBUFFER_USAGE_GPU_CUBE_MAP = 1UL << 25,
+  AHARDWAREBUFFER_USAGE_GPU_MIPMAP_COMPLETE = 1UL << 26,
+  AHARDWAREBUFFER_USAGE_VENDOR_0 = 1ULL << 28,
+  AHARDWAREBUFFER_USAGE_VENDOR_1 = 1ULL << 29,
+  AHARDWAREBUFFER_USAGE_VENDOR_2 = 1ULL << 30,
+  AHARDWAREBUFFER_USAGE_VENDOR_3 = 1ULL << 31,
+  AHARDWAREBUFFER_USAGE_VENDOR_4 = 1ULL << 48,
+  AHARDWAREBUFFER_USAGE_VENDOR_5 = 1ULL << 49,
+  AHARDWAREBUFFER_USAGE_VENDOR_6 = 1ULL << 50,
+  AHARDWAREBUFFER_USAGE_VENDOR_7 = 1ULL << 51,
+  AHARDWAREBUFFER_USAGE_VENDOR_8 = 1ULL << 52,
+  AHARDWAREBUFFER_USAGE_VENDOR_9 = 1ULL << 53,
+  AHARDWAREBUFFER_USAGE_VENDOR_10 = 1ULL << 54,
+  AHARDWAREBUFFER_USAGE_VENDOR_11 = 1ULL << 55,
+  AHARDWAREBUFFER_USAGE_VENDOR_12 = 1ULL << 56,
+  AHARDWAREBUFFER_USAGE_VENDOR_13 = 1ULL << 57,
+  AHARDWAREBUFFER_USAGE_VENDOR_14 = 1ULL << 58,
+  AHARDWAREBUFFER_USAGE_VENDOR_15 = 1ULL << 59,
+  AHARDWAREBUFFER_USAGE_VENDOR_16 = 1ULL << 60,
+  AHARDWAREBUFFER_USAGE_VENDOR_17 = 1ULL << 61,
+  AHARDWAREBUFFER_USAGE_VENDOR_18 = 1ULL << 62,
+  AHARDWAREBUFFER_USAGE_VENDOR_19 = 1ULL << 63
+}
+
+
+AHardwareBuffer_Desc
+#include <hardware_buffer.h>
+Buffer description.
+
+Summary
+Used for allocating new buffers and querying parameters of existing ones.
+
+Public attributes
+format	uint32_t    One of AHARDWAREBUFFER_FORMAT_*.
+height	uint32_t    Height in pixels.
+layers	uint32_t    Number of images in an image array.
+rfu0	uint32_t    Initialize to zero, reserved for future use.
+rfu1	uint64_t    Initialize to zero, reserved for future use.
+stride	uint32_t    Row stride in pixels, ignored for AHardwareBuffer_allocate()
+usage	uint64_t    Combination of AHARDWAREBUFFER_USAGE_*.
+width	uint32_t    Width in pixels.
+*/
+#endif  // VK_USE_PLATFORM_ANDROID_KHR
+
 // Fwd declarations of layer_data and helpers to look-up/validate state from layer_data maps
 namespace core_validation {
 struct layer_data;
@@ -1158,9 +1295,10 @@ bool ValidateCmdSubpassState(const layer_data *dev_data, const GLOBAL_CB_NODE *p
 bool ValidateCmd(layer_data *dev_data, const GLOBAL_CB_NODE *cb_state, const CMD_TYPE cmd, const char *caller_name);
 
 // Prototypes for layer_data accessor functions.  These should be in their own header file at some point
-VkFormatProperties GetFormatProperties(const core_validation::layer_data *device_data, const VkFormat format);
-VkResult GetImageFormatProperties(core_validation::layer_data *device_data, const VkImageCreateInfo *image_ci,
-                                  VkImageFormatProperties *image_format_properties);
+VkFormatProperties GetPDFormatProperties(const core_validation::layer_data *device_data, const VkFormat format);
+VkResult GetPDImageFormatProperties(core_validation::layer_data *, const VkImageCreateInfo *, VkImageFormatProperties *);
+VkResult GetPDImageFormatProperties2(core_validation::layer_data *, const VkPhysicalDeviceImageFormatInfo2 *,
+                                     VkImageFormatProperties2 *);
 const debug_report_data *GetReportData(const layer_data *);
 const VkPhysicalDeviceProperties *GetPhysicalDeviceProperties(const layer_data *);
 const CHECK_DISABLED *GetDisables(layer_data *);
@@ -1171,6 +1309,9 @@ std::unordered_map<ImageSubresourcePair, IMAGE_LAYOUT_NODE> const *GetImageLayou
 std::unordered_map<VkBuffer, std::unique_ptr<BUFFER_STATE>> *GetBufferMap(layer_data *device_data);
 std::unordered_map<VkBufferView, std::unique_ptr<BUFFER_VIEW_STATE>> *GetBufferViewMap(layer_data *device_data);
 std::unordered_map<VkImageView, std::unique_ptr<IMAGE_VIEW_STATE>> *GetImageViewMap(layer_data *device_data);
+std::unordered_map<VkSamplerYcbcrConversion, uint64_t> *GetYcbcrConversionFormatMap(layer_data *);
+std::unordered_set<uint64_t> *GetAHBExternalFormatsSet(layer_data *);
+
 const DeviceExtensions *GetDeviceExtensions(const layer_data *);
 uint32_t GetApiVersion(const layer_data *);
 
